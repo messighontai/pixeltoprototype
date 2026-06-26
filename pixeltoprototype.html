@@ -213,11 +213,11 @@ class ImageAnalyzer {
     }
     breaks.push(this.height);
     
-    // Create regions from breaks
+    // Create regions from breaks (minimum 50px height to avoid tiny meaningless sections)
     for (let i = 0; i < breaks.length - 1; i++) {
       const y1 = breaks[i];
       const y2 = breaks[i + 1];
-      if (y2 - y1 > 20) {
+      if (y2 - y1 > 50) {
         regions.push({ x: 0, y: y1, width: this.width, height: y2 - y1 });
       }
     }
@@ -227,7 +227,7 @@ class ImageAnalyzer {
 
   // Detect uniform color blocks (potential components)
   detectComponents() {
-    const blockSize = Math.max(8, Math.min(this.width, this.height) / 40);
+    const blockSize = Math.max(12, Math.min(this.width, this.height) / 30);
     const components = [];
     const visited = new Set();
     
@@ -248,7 +248,7 @@ class ImageAnalyzer {
           for (let dx = 0; dx < blockSize * 8 && x + dx < this.width && uniform; dx += blockSize/2) {
             const ci = (Math.floor(y + dy) * this.width + Math.floor(x + dx)) * 4;
             const d = colorDistance(baseColor, [this.pixels[ci], this.pixels[ci+1], this.pixels[ci+2]]);
-            if (d < 30) {
+            if (d < 40) {
               maxX = Math.max(maxX, x + dx);
               maxY = Math.max(maxY, y + dy);
             } else {
@@ -260,7 +260,7 @@ class ImageAnalyzer {
         const w = maxX - x + blockSize;
         const h = maxY - y + blockSize;
         
-        if (w > blockSize * 2 && h > blockSize * 1.5) {
+        if (w > blockSize * 3 && h > blockSize * 2.5) {
           const aspect = w / h;
           let type = 'container';
           
@@ -330,7 +330,7 @@ class ImageAnalyzer {
       current = merged;
     }
     
-    return current.slice(0, 50); // Limit to 50 components
+    return current.slice(0, 30); // Limit to 30 components for quality
   }
 
   // Detect spacing patterns
@@ -706,7 +706,7 @@ function AnalysisPanel({ progress, isAnalyzing }) {
     { label: 'Generating editable layers', key: 'layers' },
   ];
 
-  if (!isAnalyzing && progress === 0) return null;
+  if (!isAnalyzing) return null;
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 animate-slide-in">
@@ -2189,9 +2189,11 @@ function App() {
         console.warn('Failed to save to IndexedDB:', e);
       }
 
-      // Finish
-      await new Promise(r => setTimeout(r, 500));
-      setIsAnalyzing(false);
+      // Finish - auto-dismiss the analysis modal after 1 second
+      setTimeout(() => {
+        setIsAnalyzing(false);
+        setAnalysisProgress(0);
+      }, 1000);
       setActiveTab('layers');
     } catch (error) {
       console.error('Analysis failed:', error);
