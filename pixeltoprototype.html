@@ -1,0 +1,2597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PixelToPrototype AI - Convert Screenshots to Editable Designs</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      colors: {
+        editor: {
+          bg: '#1e1e2e',
+          surface: '#252536',
+          panel: '#2a2a3c',
+          border: '#3a3a4c',
+          hover: '#3a3a50',
+          active: '#4a4a6a',
+          text: '#e0e0f0',
+          muted: '#8888aa',
+          accent: '#7c6ef6',
+          accentHover: '#9580ff',
+        }
+      }
+    }
+  }
+}
+</script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #252536; }
+::-webkit-scrollbar-thumb { background: #4a4a6a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #5a5a7a; }
+.layer-tree-item:hover { background: rgba(124, 110, 246, 0.1); }
+.layer-tree-item.selected { background: rgba(124, 110, 246, 0.2); border-left: 2px solid #7c6ef6; }
+.panel-section { border-bottom: 1px solid #3a3a4c; }
+.resize-handle { position: absolute; background: #7c6ef6; border: 1px solid #fff; border-radius: 1px; cursor: pointer; }
+.canvas-grid { background-image: radial-gradient(circle, #3a3a4c 1px, transparent 1px); background-size: 20px 20px; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+@keyframes spin { to{transform:rotate(360deg)} }
+@keyframes slideIn { from{opacity:0;transform:translateY(-4px)} to{opacity:1;transform:translateY(0)} }
+@keyframes progress { from{width:0} to{width:100%} }
+.animate-pulse-custom { animation: pulse 1.5s ease-in-out infinite; }
+.animate-spin-custom { animation: spin 1s linear infinite; }
+.animate-slide-in { animation: slideIn 0.2s ease; }
+.context-menu { position:fixed; z-index:9999; background:#2a2a3c; border:1px solid #3a3a4c; border-radius:6px; box-shadow:0 8px 32px rgba(0,0,0,0.4); min-width:180px; padding:4px; }
+.context-menu-item { padding:6px 12px; cursor:pointer; border-radius:4px; font-size:12px; color:#e0e0f0; display:flex; align-items:center; gap:8px; }
+.context-menu-item:hover { background:#3a3a50; }
+.drop-zone-active { border-color:#7c6ef6 !important; background:rgba(124,110,246,0.1) !important; }
+.progress-bar { height:3px; background:linear-gradient(90deg,#7c6ef6,#9580ff); border-radius:2px; transition:width 0.3s ease; }
+input[type="number"] { -moz-appearance:textfield; }
+input[type="number"]::-webkit-outer-spin-button,input[type="number"]::-webkit-inner-spin-button { -webkit-appearance:none; }
+.selection-box { border:1px solid #7c6ef6; background:rgba(124,110,246,0.05); }
+.smart-guide { position:absolute; background:#ff4488; z-index:100; }
+.tab-active { border-bottom:2px solid #7c6ef6; color:#e0e0f0; }
+.tab-inactive { border-bottom:2px solid transparent; color:#8888aa; }
+.btn-primary { background:#7c6ef6; color:#fff; border:none; border-radius:6px; padding:6px 12px; cursor:pointer; font-size:12px; transition:background 0.2s; }
+.btn-primary:hover { background:#9580ff; }
+.input-field { background:#1e1e2e; border:1px solid #3a3a4c; border-radius:4px; padding:4px 8px; color:#e0e0f0; font-size:12px; width:100%; }
+.input-field:focus { outline:none; border-color:#7c6ef6; }
+</style>
+</head>
+<body class="dark bg-editor-bg text-editor-text">
+<div id="root"></div>
+<script type="text/babel">
+
+// ============================================================
+// UTILITY FUNCTIONS
+// ============================================================
+const { useState, useEffect, useRef, useCallback, useMemo, useReducer } = React;
+const NL = String.fromCharCode(10);
+
+function generateId() {
+  return 'l_' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+}
+
+function clamp(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+function hexToRgb(hex) {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : null;
+}
+
+function colorDistance(c1, c2) {
+  return Math.sqrt(Math.pow(c1[0]-c2[0],2) + Math.pow(c1[1]-c2[1],2) + Math.pow(c1[2]-c2[2],2));
+}
+
+// ============================================================
+// IMAGE ANALYSIS ENGINE
+// ============================================================
+
+class ImageAnalyzer {
+  constructor(imageData, width, height) {
+    this.imageData = imageData;
+    this.width = width;
+    this.height = height;
+    this.pixels = imageData.data;
+  }
+
+  // K-Means color clustering
+  extractColors(k = 8) {
+    const samples = [];
+    const step = Math.max(1, Math.floor((this.width * this.height) / 5000));
+    for (let i = 0; i < this.pixels.length; i += step * 4) {
+      const r = this.pixels[i], g = this.pixels[i+1], b = this.pixels[i+2], a = this.pixels[i+3];
+      if (a > 128) samples.push([r, g, b]);
+    }
+    
+    // Initialize centroids
+    let centroids = [];
+    for (let i = 0; i < k; i++) {
+      centroids.push(samples[Math.floor(Math.random() * samples.length)] || [128, 128, 128]);
+    }
+    
+    // K-means iterations
+    for (let iter = 0; iter < 20; iter++) {
+      const clusters = Array.from({length: k}, () => []);
+      for (const sample of samples) {
+        let minDist = Infinity, minIdx = 0;
+        for (let c = 0; c < k; c++) {
+          const d = colorDistance(sample, centroids[c]);
+          if (d < minDist) { minDist = d; minIdx = c; }
+        }
+        clusters[minIdx].push(sample);
+      }
+      
+      for (let c = 0; c < k; c++) {
+        if (clusters[c].length > 0) {
+          centroids[c] = [
+            Math.round(clusters[c].reduce((s, p) => s + p[0], 0) / clusters[c].length),
+            Math.round(clusters[c].reduce((s, p) => s + p[1], 0) / clusters[c].length),
+            Math.round(clusters[c].reduce((s, p) => s + p[2], 0) / clusters[c].length)
+          ];
+        }
+      }
+    }
+    
+    // Count occurrences and sort by frequency
+    const colorCounts = centroids.map((c, i) => ({ color: c, hex: rgbToHex(c[0], c[1], c[2]), count: 0 }));
+    const step2 = Math.max(1, Math.floor((this.width * this.height) / 2000));
+    for (let i = 0; i < this.pixels.length; i += step2 * 4) {
+      const px = [this.pixels[i], this.pixels[i+1], this.pixels[i+2]];
+      let minDist = Infinity, minIdx = 0;
+      for (let c = 0; c < k; c++) {
+        const d = colorDistance(px, centroids[c]);
+        if (d < minDist) { minDist = d; minIdx = c; }
+      }
+      colorCounts[minIdx].count++;
+    }
+    
+    return colorCounts.sort((a, b) => b.count - a.count).filter(c => c.count > 0);
+  }
+
+  // Edge detection using Sobel operator
+  detectEdges() {
+    const gray = new Float32Array(this.width * this.height);
+    for (let i = 0; i < this.width * this.height; i++) {
+      const idx = i * 4;
+      gray[i] = 0.299 * this.pixels[idx] + 0.587 * this.pixels[idx+1] + 0.114 * this.pixels[idx+2];
+    }
+    
+    const edges = new Float32Array(this.width * this.height);
+    const gx = [-1,0,1,-2,0,2,-1,0,1];
+    const gy = [-1,-2,-1,0,0,0,1,2,1];
+    
+    for (let y = 1; y < this.height - 1; y++) {
+      for (let x = 1; x < this.width - 1; x++) {
+        let sumX = 0, sumY = 0;
+        for (let ky = -1; ky <= 1; ky++) {
+          for (let kx = -1; kx <= 1; kx++) {
+            const idx = (y + ky) * this.width + (x + kx);
+            const ki = (ky + 1) * 3 + (kx + 1);
+            sumX += gray[idx] * gx[ki];
+            sumY += gray[idx] * gy[ki];
+          }
+        }
+        edges[y * this.width + x] = Math.sqrt(sumX * sumX + sumY * sumY);
+      }
+    }
+    return edges;
+  }
+
+  // Detect horizontal and vertical lines (layout boundaries)
+  detectLayoutRegions() {
+    const edges = this.detectEdges();
+    const threshold = 50;
+    const regions = [];
+    
+    // Scan for horizontal lines (row-based density)
+    const rowDensity = new Float32Array(this.height);
+    for (let y = 0; y < this.height; y++) {
+      let count = 0;
+      for (let x = 0; x < this.width; x++) {
+        if (edges[y * this.width + x] > threshold) count++;
+      }
+      rowDensity[y] = count / this.width;
+    }
+    
+    // Find section breaks (rows with high edge density)
+    const breaks = [0];
+    let inBreak = false;
+    for (let y = 0; y < this.height; y++) {
+      if (rowDensity[y] > 0.3 && !inBreak) {
+        breaks.push(y);
+        inBreak = true;
+      } else if (rowDensity[y] < 0.1) {
+        inBreak = false;
+      }
+    }
+    breaks.push(this.height);
+    
+    // Create regions from breaks
+    for (let i = 0; i < breaks.length - 1; i++) {
+      const y1 = breaks[i];
+      const y2 = breaks[i + 1];
+      if (y2 - y1 > 20) {
+        regions.push({ x: 0, y: y1, width: this.width, height: y2 - y1 });
+      }
+    }
+    
+    return regions.length > 0 ? regions : [{ x: 0, y: 0, width: this.width, height: this.height }];
+  }
+
+  // Detect uniform color blocks (potential components)
+  detectComponents() {
+    const blockSize = Math.max(8, Math.min(this.width, this.height) / 40);
+    const components = [];
+    const visited = new Set();
+    
+    for (let y = 0; y < this.height - blockSize; y += blockSize) {
+      for (let x = 0; x < this.width - blockSize; x += blockSize) {
+        const key = `${Math.floor(x/blockSize)},${Math.floor(y/blockSize)}`;
+        if (visited.has(key)) continue;
+        
+        // Sample color at this block
+        const idx = (Math.floor(y) * this.width + Math.floor(x)) * 4;
+        const baseColor = [this.pixels[idx], this.pixels[idx+1], this.pixels[idx+2]];
+        
+        // Flood fill to find extent of uniform color
+        let maxX = x, maxY = y;
+        let uniform = true;
+        
+        for (let dy = 0; dy < blockSize * 4 && y + dy < this.height && uniform; dy += blockSize/2) {
+          for (let dx = 0; dx < blockSize * 8 && x + dx < this.width && uniform; dx += blockSize/2) {
+            const ci = (Math.floor(y + dy) * this.width + Math.floor(x + dx)) * 4;
+            const d = colorDistance(baseColor, [this.pixels[ci], this.pixels[ci+1], this.pixels[ci+2]]);
+            if (d < 30) {
+              maxX = Math.max(maxX, x + dx);
+              maxY = Math.max(maxY, y + dy);
+            } else {
+              uniform = false;
+            }
+          }
+        }
+        
+        const w = maxX - x + blockSize;
+        const h = maxY - y + blockSize;
+        
+        if (w > blockSize * 2 && h > blockSize * 1.5) {
+          const aspect = w / h;
+          let type = 'container';
+          
+          // Use relative thresholds based on image dimensions instead of absolute pixels
+          const relH = h / this.height;
+          const relW = w / this.width;
+          
+          if (aspect > 3 && relH < 0.05) type = 'button';
+          else if (aspect > 4 && relH < 0.04) type = 'input';
+          else if (aspect > 0.7 && aspect < 1.5 && relW < 0.25) type = 'card';
+          else if (relH < 0.06 && relW > 0.7) type = 'navigation';
+          else if (relW > 0.6) type = 'section';
+          
+          components.push({
+            x: Math.round(x), y: Math.round(y),
+            width: Math.round(w), height: Math.round(h),
+            type,
+            color: rgbToHex(baseColor[0], baseColor[1], baseColor[2])
+          });
+          
+          visited.add(key);
+        }
+      }
+    }
+    
+    // Merge overlapping components
+    return this.mergeOverlapping(components);
+  }
+
+  mergeOverlapping(components) {
+    let current = components;
+    let changed = true;
+    
+    // Run until no more merges occur (convergence)
+    while (changed) {
+      changed = false;
+      const merged = [];
+      const used = new Set();
+      
+      for (let i = 0; i < current.length; i++) {
+        if (used.has(i)) continue;
+        let rect = { ...current[i] };
+        
+        for (let j = i + 1; j < current.length; j++) {
+          if (used.has(j)) continue;
+          const other = current[j];
+          
+          // Check overlap
+          if (rect.x < other.x + other.width && rect.x + rect.width > other.x &&
+              rect.y < other.y + other.height && rect.y + rect.height > other.y &&
+              rect.type === other.type) {
+            const newX = Math.min(rect.x, other.x);
+            const newY = Math.min(rect.y, other.y);
+            rect.width = Math.max(rect.x + rect.width, other.x + other.width) - newX;
+            rect.height = Math.max(rect.y + rect.height, other.y + other.height) - newY;
+            rect.x = newX;
+            rect.y = newY;
+            used.add(j);
+            changed = true;
+          }
+        }
+        
+        merged.push(rect);
+        used.add(i);
+      }
+      
+      current = merged;
+    }
+    
+    return current.slice(0, 50); // Limit to 50 components
+  }
+
+  // Detect spacing patterns
+  detectSpacing(regions) {
+    const gaps = [];
+    for (let i = 1; i < regions.length; i++) {
+      const gap = regions[i].y - (regions[i-1].y + regions[i-1].height);
+      if (gap > 0) gaps.push(gap);
+    }
+    
+    // Find common spacing values
+    const spacingScale = [4, 8, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96];
+    const detected = {};
+    
+    for (const gap of gaps) {
+      const nearest = spacingScale.reduce((prev, curr) => 
+        Math.abs(curr - gap) < Math.abs(prev - gap) ? curr : prev
+      );
+      detected[nearest] = (detected[nearest] || 0) + 1;
+    }
+    
+    return Object.entries(detected)
+      .sort((a, b) => b[1] - a[1])
+      .map(([value]) => parseInt(value));
+  }
+}
+
+
+// ============================================================
+// INDEXEDDB PERSISTENCE
+// ============================================================
+
+const DB_NAME = 'PixelToPrototypeDB';
+const DB_VERSION = 1;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('projects')) {
+        db.createObjectStore('projects', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('images')) {
+        db.createObjectStore('images', { keyPath: 'id' });
+      }
+    };
+  });
+}
+
+async function saveProject(project) {
+  const db = await openDB();
+  const tx = db.transaction('projects', 'readwrite');
+  tx.objectStore('projects').put(project);
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadProject(id) {
+  const db = await openDB();
+  const tx = db.transaction('projects', 'readonly');
+  const request = tx.objectStore('projects').get(id);
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function listProjects() {
+  const db = await openDB();
+  const tx = db.transaction('projects', 'readonly');
+  const request = tx.objectStore('projects').getAll();
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveImage(id, dataUrl) {
+  const db = await openDB();
+  const tx = db.transaction('images', 'readwrite');
+  tx.objectStore('images').put({ id, dataUrl, timestamp: Date.now() });
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ============================================================
+// EXPORT ENGINES
+// ============================================================
+
+function generateFigmaJSON(layers, colors, typography, spacing) {
+  const figmaDoc = {
+    document: {
+      id: "0:0",
+      name: "PixelToPrototype Export",
+      type: "DOCUMENT",
+      children: [{
+        id: "0:1",
+        name: "Page 1",
+        type: "CANVAS",
+        backgroundColor: { r: 1, g: 1, b: 1, a: 1 },
+        children: layers.map((layer, i) => convertLayerToFigmaNode(layer, `1:${i}`))
+      }]
+    },
+    components: {},
+    componentSets: {},
+    schemaVersion: 0,
+    styles: generateFigmaStyles(colors, typography),
+    variables: generateFigmaVariables(colors, spacing)
+  };
+  return JSON.stringify(figmaDoc, null, 2);
+}
+
+function convertLayerToFigmaNode(layer, id) {
+  const node = {
+    id,
+    name: layer.name,
+    type: layer.type === 'text' ? 'TEXT' : 'FRAME',
+    visible: layer.visible !== false,
+    locked: layer.locked || false,
+    absoluteBoundingBox: {
+      x: layer.x || 0,
+      y: layer.y || 0,
+      width: layer.width || 100,
+      height: layer.height || 100
+    },
+    constraints: { vertical: "TOP", horizontal: "LEFT" },
+    fills: layer.fill ? [{ type: "SOLID", color: hexToFigmaColor(layer.fill), opacity: 1 }] : [],
+    strokes: layer.stroke ? [{ type: "SOLID", color: hexToFigmaColor(layer.stroke) }] : [],
+    strokeWeight: layer.strokeWidth || 0,
+    cornerRadius: layer.borderRadius || 0,
+    effects: layer.shadow ? [{
+      type: "DROP_SHADOW",
+      color: { r: 0, g: 0, b: 0, a: 0.25 },
+      offset: { x: 0, y: 4 },
+      radius: 8,
+      visible: true
+    }] : [],
+    children: (layer.children || []).map((child, i) => convertLayerToFigmaNode(child, `${id}:${i}`))
+  };
+
+  if (layer.type === 'text') {
+    node.characters = layer.content || layer.name;
+    node.style = {
+      fontFamily: layer.fontFamily || "Inter",
+      fontSize: layer.fontSize || 14,
+      fontWeight: layer.fontWeight || 400,
+      lineHeightPx: layer.lineHeight || layer.fontSize * 1.5,
+      letterSpacing: layer.letterSpacing || 0,
+      textAlignHorizontal: (layer.textAlign || 'LEFT').toUpperCase()
+    };
+  }
+
+  return node;
+}
+
+function hexToFigmaColor(hex) {
+  const rgb = hexToRgb(hex || '#000000');
+  if (!rgb) return { r: 0, g: 0, b: 0, a: 1 };
+  return { r: rgb.r / 255, g: rgb.g / 255, b: rgb.b / 255, a: 1 };
+}
+
+function generateFigmaStyles(colors, typography) {
+  const styles = {};
+  colors.forEach((c, i) => {
+    styles[`color_${i}`] = {
+      key: `color_${i}`,
+      name: `Color/${i + 1}`,
+      styleType: "FILL",
+      description: `Extracted color ${c.hex}`
+    };
+  });
+  typography.forEach((t, i) => {
+    styles[`text_${i}`] = {
+      key: `text_${i}`,
+      name: `Typography/${t.name}`,
+      styleType: "TEXT",
+      description: `${t.fontSize}px ${t.fontWeight}`
+    };
+  });
+  return styles;
+}
+
+function generateFigmaVariables(colors, spacing) {
+  return {
+    collections: [{
+      id: "colors",
+      name: "Colors",
+      modes: [{ modeId: "default", name: "Default" }],
+      variables: colors.map((c, i) => ({
+        id: `color_var_${i}`,
+        name: `color-${i + 1}`,
+        resolvedType: "COLOR",
+        valuesByMode: { default: hexToFigmaColor(c.hex) }
+      }))
+    }, {
+      id: "spacing",
+      name: "Spacing",
+      modes: [{ modeId: "default", name: "Default" }],
+      variables: spacing.map((s, i) => ({
+        id: `spacing_var_${i}`,
+        name: `spacing-${s}`,
+        resolvedType: "FLOAT",
+        valuesByMode: { default: s }
+      }))
+    }]
+  };
+}
+
+function generateDesignTokens(colors, typography, spacing) {
+  return {
+    color: Object.fromEntries(colors.map((c, i) => [`color-${i+1}`, { value: c.hex, type: 'color' }])),
+    typography: Object.fromEntries(typography.map(t => [t.name, {
+      value: { fontFamily: t.fontFamily, fontSize: `${t.fontSize}px`, fontWeight: t.fontWeight, lineHeight: `${t.lineHeight}px` },
+      type: 'typography'
+    }])),
+    spacing: Object.fromEntries(spacing.map(s => [`spacing-${s}`, { value: `${s}px`, type: 'dimension' }])),
+    borderRadius: { sm: { value: '4px', type: 'dimension' }, md: { value: '8px', type: 'dimension' }, lg: { value: '12px', type: 'dimension' }, xl: { value: '16px', type: 'dimension' } },
+    shadow: { sm: { value: '0 1px 2px rgba(0,0,0,0.05)', type: 'shadow' }, md: { value: '0 4px 6px rgba(0,0,0,0.1)', type: 'shadow' }, lg: { value: '0 10px 15px rgba(0,0,0,0.1)', type: 'shadow' } }
+  };
+}
+
+function generateHTMLExport(layers) {
+  let html = '<!DOCTYPE html>' + NL + '<html lang="en">' + NL + '<head>' + NL + '<meta charset="UTF-8">' + NL + '<meta name="viewport" content="width=device-width, initial-scale=1.0">' + NL + '<title>Exported Design</title>' + NL + '<style>' + NL;
+  html += '* { box-sizing: border-box; margin: 0; padding: 0; }' + NL;
+  html += 'body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; }' + NL;
+  
+  layers.forEach((layer, i) => {
+    html += `.layer-${i} { position: absolute; left: ${layer.x}px; top: ${layer.y}px; width: ${layer.width}px; height: ${layer.height}px;`;
+    if (layer.fill) html += ` background: ${layer.fill};`;
+    if (layer.borderRadius) html += ` border-radius: ${layer.borderRadius}px;`;
+    if (layer.fontSize) html += ` font-size: ${layer.fontSize}px;`;
+    html += ' }' + NL;
+  });
+  
+  html += '</style>' + NL + '</head>' + NL + '<body>' + NL + '<div style="position:relative;">' + NL;
+  layers.forEach((layer, i) => {
+    if (layer.type === 'text') {
+      html += `  <p class="layer-${i}">${layer.content || layer.name}</p>` + NL;
+    } else {
+      html += `  <div class="layer-${i}"></div>` + NL;
+    }
+  });
+  html += '</div>' + NL + '</body>' + NL + '</html>';
+  return html;
+}
+
+function generateReactExport(layers) {
+  let code = 'import React from "react";' + NL + NL;
+  code += 'export default function ExportedDesign() {' + NL + '  return (' + NL + '    <div style={{position: "relative"}}>' + NL;
+  layers.forEach(layer => {
+    const style = `{position:"absolute",left:${layer.x},top:${layer.y},width:${layer.width},height:${layer.height}${layer.fill?`,background:"${layer.fill}"`:""}${layer.borderRadius?`,borderRadius:${layer.borderRadius}`:""}}`;
+    if (layer.type === 'text') {
+      code += `      <p style=${style}>${layer.content || layer.name}</p>` + NL;
+    } else {
+      code += `      <div style=${style} />` + NL;
+    }
+  });
+  code += '    </div>' + NL + '  );' + NL + '}';
+  return code;
+}
+
+function generateTailwindExport(layers) {
+  let html = '<div class="relative">' + NL;
+  layers.forEach(layer => {
+    const classes = `absolute`;
+    if (layer.type === 'text') {
+      html += `  <p class="${classes}" style="left:${layer.x}px;top:${layer.y}px;width:${layer.width}px">${layer.content || layer.name}</p>` + NL;
+    } else {
+      html += `  <div class="${classes} rounded" style="left:${layer.x}px;top:${layer.y}px;width:${layer.width}px;height:${layer.height}px;background:${layer.fill||'#eee'}"></div>` + NL;
+    }
+  });
+  html += '</div>';
+  return html;
+}
+
+function generateCSSExport(layers) {
+  let css = '/* Generated by PixelToPrototype AI */' + NL + NL;
+  layers.forEach((layer, i) => {
+    css += `.${layer.name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()} {` + NL;
+    css += `  position: absolute;` + NL + `  left: ${layer.x}px;` + NL + `  top: ${layer.y}px;` + NL + `  width: ${layer.width}px;` + NL + `  height: ${layer.height}px;` + NL;
+    if (layer.fill) css += `  background-color: ${layer.fill};` + NL;
+    if (layer.borderRadius) css += `  border-radius: ${layer.borderRadius}px;` + NL;
+    if (layer.fontSize) css += `  font-size: ${layer.fontSize}px;` + NL;
+    css += '}' + NL + NL;
+  });
+  return css;
+}
+
+function generateSVGExport(layers, width, height) {
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` + NL;
+  layers.forEach(layer => {
+    if (layer.type === 'text') {
+      svg += `  <text x="${layer.x}" y="${layer.y + (layer.fontSize || 14)}" font-size="${layer.fontSize || 14}" fill="${layer.fill || '#000'}">${layer.content || layer.name}</text>` + NL;
+    } else {
+      svg += `  <rect x="${layer.x}" y="${layer.y}" width="${layer.width}" height="${layer.height}" fill="${layer.fill || '#ccc'}" rx="${layer.borderRadius || 0}" />` + NL;
+    }
+  });
+  svg += '</svg>';
+  return svg;
+}
+
+function downloadFile(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+
+// ============================================================
+// ICONS (inline SVG components)
+// ============================================================
+
+const Icons = {
+  Upload: () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>,
+  Layers: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>,
+  Component: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>,
+  Type: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>,
+  Palette: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="13.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="10.5" r="2.5"/><circle cx="8.5" cy="7.5" r="2.5"/><circle cx="6.5" cy="12.5" r="2.5"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.9 0 1.7-.8 1.7-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-.9.8-1.7 1.7-1.7H16c3.3 0 6-2.7 6-6 0-5.5-4.5-9.8-10-9.8z"/></svg>,
+  Export: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
+  Eye: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
+  EyeOff: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>,
+  Lock: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>,
+  Unlock: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 019.9-1"/></svg>,
+  Trash: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>,
+  Copy: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>,
+  Plus: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
+  Minus: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12"/></svg>,
+  ChevronRight: () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>,
+  ChevronDown: () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9"/></svg>,
+  Folder: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>,
+  Frame: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="22" y1="2" x2="22" y2="22"/><line x1="2" y1="2" x2="2" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="2" x2="22" y2="2"/><line x1="2" y1="22" x2="22" y2="22"/></svg>,
+  Image: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>,
+  Text: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>,
+  ZoomIn: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>,
+  ZoomOut: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>,
+  Maximize: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/></svg>,
+  Move: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></svg>,
+  Cursor: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1"><path d="M4 4l7 18 2.5-7.5L21 12z"/></svg>,
+  Grid: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>,
+  Settings: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68 1.65 1.65 0 0010 3.17V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.32 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></svg>,
+  Spacing: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 3H3v18h18V3z"/><path d="M9 3v18"/><path d="M15 3v18"/></svg>,
+  AlignLeft: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="17" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="17" y1="18" x2="3" y2="18"/></svg>,
+  AlignCenter: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="10" x2="6" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="18" y1="18" x2="6" y2="18"/></svg>,
+  AlignRight: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="21" y1="10" x2="7" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="7" y2="18"/></svg>,
+  Figma: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M5 5.5A3.5 3.5 0 018.5 2H12v7H8.5A3.5 3.5 0 015 5.5zM12 2h3.5a3.5 3.5 0 110 7H12V2zm0 12.5a3.5 3.5 0 117 0 3.5 3.5 0 11-7 0z"/><path d="M5 19.5A3.5 3.5 0 018.5 16H12v3.5a3.5 3.5 0 11-7 0zM5 12.5A3.5 3.5 0 018.5 9H12v7H8.5A3.5 3.5 0 015 12.5z"/></svg>,
+};
+
+
+// ============================================================
+// ANALYSIS PROGRESS PANEL
+// ============================================================
+
+function AnalysisPanel({ progress, isAnalyzing }) {
+  const steps = [
+    { label: 'Detecting layout structure', key: 'layout' },
+    { label: 'Detecting typography', key: 'typography' },
+    { label: 'Extracting colors', key: 'colors' },
+    { label: 'Detecting components', key: 'components' },
+    { label: 'Rebuilding structure', key: 'structure' },
+    { label: 'Generating editable layers', key: 'layers' },
+  ];
+
+  if (!isAnalyzing && progress === 0) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 animate-slide-in">
+      <div className="bg-editor-panel rounded-xl p-8 w-96 shadow-2xl border border-editor-border">
+        <div className="flex items-center gap-3 mb-6">
+          <div className="w-8 h-8 rounded-full bg-editor-accent/20 flex items-center justify-center">
+            <div className="w-4 h-4 border-2 border-editor-accent border-t-transparent rounded-full animate-spin-custom"></div>
+          </div>
+          <div>
+            <h3 className="text-base font-semibold text-editor-text">Analyzing Image</h3>
+            <p className="text-xs text-editor-muted">AI is processing your screenshot</p>
+          </div>
+        </div>
+        
+        <div className="space-y-3">
+          {steps.map((step, i) => {
+            const stepProgress = Math.min(100, Math.max(0, (progress - i * 16.66) / 16.66 * 100));
+            const isComplete = progress > (i + 1) * 16.66;
+            const isActive = progress >= i * 16.66 && !isComplete;
+            
+            return (
+              <div key={step.key} className="flex items-center gap-3">
+                <div className={`w-5 h-5 rounded-full flex items-center justify-center text-xs ${
+                  isComplete ? 'bg-green-500 text-white' : isActive ? 'bg-editor-accent text-white' : 'bg-editor-border text-editor-muted'
+                }`}>
+                  {isComplete ? '✓' : (i + 1)}
+                </div>
+                <div className="flex-1">
+                  <div className="text-xs text-editor-text">{step.label}</div>
+                  {isActive && (
+                    <div className="mt-1 h-1 bg-editor-border rounded-full overflow-hidden">
+                      <div className="progress-bar h-full" style={{ width: `${stepProgress}%` }}></div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        
+        <div className="mt-6 h-2 bg-editor-border rounded-full overflow-hidden">
+          <div className="progress-bar h-full" style={{ width: `${progress}%` }}></div>
+        </div>
+        <div className="mt-2 text-xs text-editor-muted text-center">{Math.round(progress)}% complete</div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// LEFT SIDEBAR - LAYER TREE
+// ============================================================
+
+function LayerTreeItem({ layer, depth = 0, selectedLayers, onSelect, onToggleVisibility, onToggleLock, onRename, onDelete, onDuplicate }) {
+  const [expanded, setExpanded] = useState(true);
+  const [editing, setEditing] = useState(false);
+  const [editName, setEditName] = useState(layer.name);
+  const isSelected = selectedLayers.includes(layer.id);
+  const hasChildren = layer.children && layer.children.length > 0;
+
+  const handleDoubleClick = (e) => {
+    e.stopPropagation();
+    setEditing(true);
+    setEditName(layer.name);
+  };
+
+  const handleRenameSubmit = () => {
+    setEditing(false);
+    if (editName.trim()) onRename(layer.id, editName.trim());
+  };
+
+  const getIcon = () => {
+    switch(layer.type) {
+      case 'frame': return <Icons.Frame />;
+      case 'text': return <Icons.Text />;
+      case 'image': return <Icons.Image />;
+      case 'section': return <Icons.Folder />;
+      case 'group': return <Icons.Folder />;
+      default: return <Icons.Component />;
+    }
+  };
+
+  return (
+    <div>
+      <div
+        className={`layer-tree-item flex items-center gap-1 py-1 px-2 cursor-pointer ${isSelected ? 'selected' : ''}`}
+        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+        onClick={(e) => onSelect(layer.id, e.shiftKey || e.metaKey)}
+        onDoubleClick={handleDoubleClick}
+      >
+        {hasChildren ? (
+          <span onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }} className="cursor-pointer opacity-60 hover:opacity-100">
+            {expanded ? <Icons.ChevronDown /> : <Icons.ChevronRight />}
+          </span>
+        ) : <span className="w-3"></span>}
+        
+        <span className="opacity-60">{getIcon()}</span>
+        
+        {editing ? (
+          <input
+            className="input-field flex-1 py-0 text-xs"
+            value={editName}
+            onChange={(e) => setEditName(e.target.value)}
+            onBlur={handleRenameSubmit}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleRenameSubmit(); if (e.key === 'Escape') setEditing(false); }}
+            autoFocus
+            onClick={(e) => e.stopPropagation()}
+          />
+        ) : (
+          <span className="flex-1 text-xs truncate">{layer.name}</span>
+        )}
+        
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100" style={{ opacity: isSelected ? 1 : undefined }}>
+          <button onClick={(e) => { e.stopPropagation(); onToggleVisibility(layer.id); }} className="hover:text-editor-accent">
+            {layer.visible !== false ? <Icons.Eye /> : <Icons.EyeOff />}
+          </button>
+          <button onClick={(e) => { e.stopPropagation(); onToggleLock(layer.id); }} className="hover:text-editor-accent">
+            {layer.locked ? <Icons.Lock /> : <Icons.Unlock />}
+          </button>
+        </div>
+      </div>
+      
+      {expanded && hasChildren && layer.children.map(child => (
+        <LayerTreeItem
+          key={child.id}
+          layer={child}
+          depth={depth + 1}
+          selectedLayers={selectedLayers}
+          onSelect={onSelect}
+          onToggleVisibility={onToggleVisibility}
+          onToggleLock={onToggleLock}
+          onRename={onRename}
+          onDelete={onDelete}
+          onDuplicate={onDuplicate}
+        />
+      ))}
+    </div>
+  );
+}
+
+
+// ============================================================
+// LEFT SIDEBAR COMPONENT
+// ============================================================
+
+function LeftSidebar({ layers, selectedLayers, onSelect, onToggleVisibility, onToggleLock, onRename, onDelete, onDuplicate, colors, typography, spacing, onUpload, activeTab, setActiveTab, onExport }) {
+  const tabs = [
+    { id: 'layers', icon: <Icons.Layers />, label: 'Layers' },
+    { id: 'components', icon: <Icons.Component />, label: 'Components' },
+    { id: 'typography', icon: <Icons.Type />, label: 'Type' },
+    { id: 'colors', icon: <Icons.Palette />, label: 'Colors' },
+    { id: 'spacing', icon: <Icons.Spacing />, label: 'Spacing' },
+    { id: 'export', icon: <Icons.Export />, label: 'Export' },
+  ];
+
+  return (
+    <div className="w-64 bg-editor-panel border-r border-editor-border flex flex-col h-full">
+      {/* Tab buttons */}
+      <div className="flex border-b border-editor-border">
+        {tabs.map(tab => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`flex-1 py-2 flex flex-col items-center gap-0.5 text-xs transition-colors ${
+              activeTab === tab.id ? 'text-editor-accent bg-editor-hover' : 'text-editor-muted hover:text-editor-text'
+            }`}
+            title={tab.label}
+          >
+            {tab.icon}
+          </button>
+        ))}
+      </div>
+
+      {/* Upload button */}
+      <div className="p-3 border-b border-editor-border">
+        <button onClick={onUpload} className="btn-primary w-full flex items-center justify-center gap-2 py-2">
+          <Icons.Upload /> Upload Image
+        </button>
+      </div>
+
+      {/* Tab content */}
+      <div className="flex-1 overflow-y-auto">
+        {activeTab === 'layers' && (
+          <div className="py-2">
+            {layers.length === 0 ? (
+              <div className="px-4 py-8 text-center text-editor-muted text-xs">
+                Upload an image to generate layers
+              </div>
+            ) : (
+              layers.map(layer => (
+                <LayerTreeItem
+                  key={layer.id}
+                  layer={layer}
+                  selectedLayers={selectedLayers}
+                  onSelect={onSelect}
+                  onToggleVisibility={onToggleVisibility}
+                  onToggleLock={onToggleLock}
+                  onRename={onRename}
+                  onDelete={onDelete}
+                  onDuplicate={onDuplicate}
+                />
+              ))
+            )}
+          </div>
+        )}
+
+        {activeTab === 'components' && (
+          <div className="p-3 space-y-2">
+            <h4 className="text-xs font-semibold text-editor-muted uppercase tracking-wider">Detected Components</h4>
+            {layers.length === 0 ? (
+              <p className="text-xs text-editor-muted py-4 text-center">No components detected yet</p>
+            ) : (
+              <div className="space-y-1">
+                {getAllLayers(layers).filter(l => ['button','input','card','navigation','section','container'].includes(l.type)).map(layer => (
+                  <div key={layer.id} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-editor-hover cursor-pointer text-xs" onClick={() => onSelect(layer.id, false)}>
+                    <Icons.Component />
+                    <span className="flex-1 truncate">{layer.name}</span>
+                    <span className="text-editor-muted capitalize text-[10px]">{layer.type}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'typography' && (
+          <div className="p-3 space-y-3">
+            <h4 className="text-xs font-semibold text-editor-muted uppercase tracking-wider">Typography Scale</h4>
+            {typography.length === 0 ? (
+              <p className="text-xs text-editor-muted py-4 text-center">Upload an image to detect typography</p>
+            ) : (
+              <div className="space-y-2">
+                {typography.map((t, i) => (
+                  <div key={i} className="p-2 rounded bg-editor-surface border border-editor-border">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs font-medium">{t.name}</span>
+                      <span className="text-[10px] text-editor-muted">{t.fontSize}px</span>
+                    </div>
+                    <div className="mt-1 text-editor-muted text-[10px]">
+                      {t.fontFamily} / {t.fontWeight} / {t.lineHeight}px
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'colors' && (
+          <div className="p-3 space-y-3">
+            <h4 className="text-xs font-semibold text-editor-muted uppercase tracking-wider">Color Palette</h4>
+            {colors.length === 0 ? (
+              <p className="text-xs text-editor-muted py-4 text-center">Upload an image to extract colors</p>
+            ) : (
+              <div className="grid grid-cols-4 gap-2">
+                {colors.map((c, i) => (
+                  <div key={i} className="text-center">
+                    <div className="w-full aspect-square rounded-lg border border-editor-border cursor-pointer hover:scale-110 transition-transform" style={{ background: c.hex }}
+                      onClick={() => navigator.clipboard.writeText(c.hex)}
+                      title={`Click to copy: ${c.hex}`}
+                    ></div>
+                    <span className="text-[9px] text-editor-muted mt-1 block">{c.hex}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'spacing' && (
+          <div className="p-3 space-y-3">
+            <h4 className="text-xs font-semibold text-editor-muted uppercase tracking-wider">Spacing System</h4>
+            {spacing.length === 0 ? (
+              <p className="text-xs text-editor-muted py-4 text-center">Upload an image to detect spacing</p>
+            ) : (
+              <div className="space-y-2">
+                {spacing.map((s, i) => (
+                  <div key={i} className="flex items-center gap-3 px-2 py-1.5 rounded bg-editor-surface border border-editor-border">
+                    <div className="bg-editor-accent/30 rounded" style={{ width: Math.min(s, 64), height: 12 }}></div>
+                    <span className="text-xs text-editor-text">{s}px</span>
+                    <span className="text-[10px] text-editor-muted ml-auto">{s/4}x base</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'export' && (
+          <div className="p-3 space-y-2">
+            <h4 className="text-xs font-semibold text-editor-muted uppercase tracking-wider mb-3">Export Formats</h4>
+            {[
+              { id: 'figma-json', label: 'Figma JSON', desc: 'Full node tree', icon: <Icons.Figma /> },
+              { id: 'figma-tokens', label: 'Design Tokens', desc: 'Variables & styles', icon: <Icons.Figma /> },
+              { id: 'html', label: 'HTML', desc: 'Static HTML + CSS', icon: <Icons.Frame /> },
+              { id: 'react', label: 'React JSX', desc: 'React component', icon: <Icons.Component /> },
+              { id: 'tailwind', label: 'Tailwind', desc: 'Tailwind classes', icon: <Icons.Grid /> },
+              { id: 'css', label: 'CSS', desc: 'Pure CSS styles', icon: <Icons.Palette /> },
+              { id: 'json', label: 'JSON', desc: 'Structure data', icon: <Icons.Layers /> },
+              { id: 'svg', label: 'SVG', desc: 'Vector format', icon: <Icons.Frame /> },
+              { id: 'png', label: 'PNG', desc: 'Raster image', icon: <Icons.Image /> },
+            ].map(format => (
+              <button
+                key={format.id}
+                onClick={() => onExport(format.id)}
+                className="w-full flex items-center gap-3 px-3 py-2 rounded-lg bg-editor-surface border border-editor-border hover:border-editor-accent hover:bg-editor-hover transition-all text-left"
+                disabled={layers.length === 0}
+              >
+                <span className="text-editor-accent">{format.icon}</span>
+                <div className="flex-1">
+                  <div className="text-xs font-medium">{format.label}</div>
+                  <div className="text-[10px] text-editor-muted">{format.desc}</div>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function getAllLayers(layers) {
+  let result = [];
+  for (const layer of layers) {
+    result.push(layer);
+    if (layer.children) result = result.concat(getAllLayers(layer.children));
+  }
+  return result;
+}
+
+
+// ============================================================
+// RIGHT SIDEBAR - PROPERTIES PANEL
+// ============================================================
+
+function RightSidebar({ selectedLayer, onUpdateLayer }) {
+  if (!selectedLayer) {
+    return (
+      <div className="w-64 bg-editor-panel border-l border-editor-border flex flex-col h-full">
+        <div className="p-4 border-b border-editor-border">
+          <h3 className="text-sm font-semibold">Properties</h3>
+        </div>
+        <div className="flex-1 flex items-center justify-center">
+          <p className="text-xs text-editor-muted text-center px-4">Select a layer to view its properties</p>
+        </div>
+      </div>
+    );
+  }
+
+  const update = (key, value) => {
+    onUpdateLayer(selectedLayer.id, { [key]: value });
+  };
+
+  const PropertyInput = ({ label, value, onChange, type = 'number', suffix = '' }) => (
+    <div className="flex items-center gap-2">
+      <label className="text-[10px] text-editor-muted w-6 shrink-0">{label}</label>
+      <input
+        className="input-field py-1 text-xs"
+        type={type}
+        value={value || ''}
+        onChange={(e) => onChange(type === 'number' ? parseFloat(e.target.value) || 0 : e.target.value)}
+      />
+      {suffix && <span className="text-[10px] text-editor-muted">{suffix}</span>}
+    </div>
+  );
+
+  return (
+    <div className="w-64 bg-editor-panel border-l border-editor-border flex flex-col h-full overflow-y-auto">
+      {/* Header */}
+      <div className="p-3 border-b border-editor-border">
+        <div className="flex items-center gap-2">
+          <span className="text-editor-accent"><Icons.Component /></span>
+          <h3 className="text-sm font-semibold truncate">{selectedLayer.name}</h3>
+        </div>
+        <span className="text-[10px] text-editor-muted capitalize">{selectedLayer.type}</span>
+      </div>
+
+      {/* Position & Size */}
+      <div className="p-3 panel-section">
+        <h4 className="text-[10px] font-semibold text-editor-muted uppercase tracking-wider mb-2">Position & Size</h4>
+        <div className="grid grid-cols-2 gap-2">
+          <PropertyInput label="X" value={selectedLayer.x} onChange={(v) => update('x', v)} />
+          <PropertyInput label="Y" value={selectedLayer.y} onChange={(v) => update('y', v)} />
+          <PropertyInput label="W" value={selectedLayer.width} onChange={(v) => update('width', v)} />
+          <PropertyInput label="H" value={selectedLayer.height} onChange={(v) => update('height', v)} />
+        </div>
+        <div className="mt-2">
+          <PropertyInput label="R" value={selectedLayer.rotation || 0} onChange={(v) => update('rotation', v)} suffix="deg" />
+        </div>
+      </div>
+
+      {/* Typography (for text layers) */}
+      {(selectedLayer.type === 'text' || selectedLayer.fontSize) && (
+        <div className="p-3 panel-section">
+          <h4 className="text-[10px] font-semibold text-editor-muted uppercase tracking-wider mb-2">Typography</h4>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <label className="text-[10px] text-editor-muted w-12 shrink-0">Family</label>
+              <select className="input-field py-1 text-xs" value={selectedLayer.fontFamily || 'Inter'} onChange={(e) => update('fontFamily', e.target.value)}>
+                <option value="Inter">Inter</option>
+                <option value="Roboto">Roboto</option>
+                <option value="Arial">Arial</option>
+                <option value="Helvetica">Helvetica</option>
+                <option value="Georgia">Georgia</option>
+                <option value="monospace">Monospace</option>
+              </select>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <PropertyInput label="Size" value={selectedLayer.fontSize || 14} onChange={(v) => update('fontSize', v)} />
+              <PropertyInput label="Wt" value={selectedLayer.fontWeight || 400} onChange={(v) => update('fontWeight', v)} />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <PropertyInput label="LH" value={selectedLayer.lineHeight || 1.5} onChange={(v) => update('lineHeight', v)} />
+              <PropertyInput label="LS" value={selectedLayer.letterSpacing || 0} onChange={(v) => update('letterSpacing', v)} />
+            </div>
+            <div className="flex items-center gap-1 mt-1">
+              <button onClick={() => update('textAlign', 'left')} className={`p-1.5 rounded ${selectedLayer.textAlign === 'left' ? 'bg-editor-accent/20 text-editor-accent' : 'hover:bg-editor-hover'}`}><Icons.AlignLeft /></button>
+              <button onClick={() => update('textAlign', 'center')} className={`p-1.5 rounded ${selectedLayer.textAlign === 'center' ? 'bg-editor-accent/20 text-editor-accent' : 'hover:bg-editor-hover'}`}><Icons.AlignCenter /></button>
+              <button onClick={() => update('textAlign', 'right')} className={`p-1.5 rounded ${selectedLayer.textAlign === 'right' ? 'bg-editor-accent/20 text-editor-accent' : 'hover:bg-editor-hover'}`}><Icons.AlignRight /></button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fill */}
+      <div className="p-3 panel-section">
+        <h4 className="text-[10px] font-semibold text-editor-muted uppercase tracking-wider mb-2">Fill</h4>
+        <div className="flex items-center gap-2">
+          <input
+            type="color"
+            className="w-8 h-8 rounded border border-editor-border cursor-pointer"
+            value={selectedLayer.fill || '#ffffff'}
+            onChange={(e) => update('fill', e.target.value)}
+          />
+          <input
+            className="input-field py-1 text-xs flex-1"
+            value={selectedLayer.fill || '#ffffff'}
+            onChange={(e) => update('fill', e.target.value)}
+          />
+        </div>
+      </div>
+
+      {/* Stroke */}
+      <div className="p-3 panel-section">
+        <h4 className="text-[10px] font-semibold text-editor-muted uppercase tracking-wider mb-2">Stroke</h4>
+        <div className="flex items-center gap-2">
+          <input
+            type="color"
+            className="w-8 h-8 rounded border border-editor-border cursor-pointer"
+            value={selectedLayer.stroke || '#000000'}
+            onChange={(e) => update('stroke', e.target.value)}
+          />
+          <input
+            className="input-field py-1 text-xs flex-1"
+            value={selectedLayer.stroke || ''}
+            onChange={(e) => update('stroke', e.target.value)}
+            placeholder="none"
+          />
+          <input
+            className="input-field py-1 text-xs w-12"
+            type="number"
+            value={selectedLayer.strokeWidth || 0}
+            onChange={(e) => update('strokeWidth', parseFloat(e.target.value) || 0)}
+            min="0"
+          />
+        </div>
+      </div>
+
+      {/* Border Radius */}
+      <div className="p-3 panel-section">
+        <h4 className="text-[10px] font-semibold text-editor-muted uppercase tracking-wider mb-2">Radius</h4>
+        <PropertyInput label="R" value={selectedLayer.borderRadius || 0} onChange={(v) => update('borderRadius', v)} suffix="px" />
+      </div>
+
+      {/* Shadow */}
+      <div className="p-3 panel-section">
+        <h4 className="text-[10px] font-semibold text-editor-muted uppercase tracking-wider mb-2">Shadow</h4>
+        <div className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={selectedLayer.shadow || false}
+            onChange={(e) => update('shadow', e.target.checked)}
+            className="rounded"
+          />
+          <span className="text-xs text-editor-muted">Drop Shadow</span>
+        </div>
+        {selectedLayer.shadow && (
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <PropertyInput label="X" value={selectedLayer.shadowX || 0} onChange={(v) => update('shadowX', v)} />
+            <PropertyInput label="Y" value={selectedLayer.shadowY || 4} onChange={(v) => update('shadowY', v)} />
+            <PropertyInput label="B" value={selectedLayer.shadowBlur || 8} onChange={(v) => update('shadowBlur', v)} />
+            <PropertyInput label="S" value={selectedLayer.shadowSpread || 0} onChange={(v) => update('shadowSpread', v)} />
+          </div>
+        )}
+      </div>
+
+      {/* Auto Layout */}
+      <div className="p-3 panel-section">
+        <h4 className="text-[10px] font-semibold text-editor-muted uppercase tracking-wider mb-2">Auto Layout</h4>
+        <div className="flex items-center gap-2">
+          <select className="input-field py-1 text-xs" value={selectedLayer.autoLayout || 'none'} onChange={(e) => update('autoLayout', e.target.value)}>
+            <option value="none">None</option>
+            <option value="horizontal">Horizontal</option>
+            <option value="vertical">Vertical</option>
+            <option value="grid">Grid</option>
+          </select>
+        </div>
+        {selectedLayer.autoLayout && selectedLayer.autoLayout !== 'none' && (
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <PropertyInput label="Gap" value={selectedLayer.gap || 8} onChange={(v) => update('gap', v)} />
+            <PropertyInput label="Pad" value={selectedLayer.padding || 0} onChange={(v) => update('padding', v)} />
+          </div>
+        )}
+      </div>
+
+      {/* Constraints */}
+      <div className="p-3 panel-section">
+        <h4 className="text-[10px] font-semibold text-editor-muted uppercase tracking-wider mb-2">Constraints</h4>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-[10px] text-editor-muted block mb-1">Horizontal</label>
+            <select className="input-field py-1 text-xs" value={selectedLayer.constraintH || 'left'} onChange={(e) => update('constraintH', e.target.value)}>
+              <option value="left">Left</option>
+              <option value="right">Right</option>
+              <option value="center">Center</option>
+              <option value="stretch">Stretch</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-[10px] text-editor-muted block mb-1">Vertical</label>
+            <select className="input-field py-1 text-xs" value={selectedLayer.constraintV || 'top'} onChange={(e) => update('constraintV', e.target.value)}>
+              <option value="top">Top</option>
+              <option value="bottom">Bottom</option>
+              <option value="center">Center</option>
+              <option value="stretch">Stretch</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// CENTER CANVAS
+// ============================================================
+
+function CanvasEditor({ layers, selectedLayers, onSelect, onUpdateLayer, onDragStart, onDragEnd, zoom, pan, onZoom, onPan, canvasSize, sourceImage }) {
+  const canvasRef = useRef(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [dragType, setDragType] = useState(null); // 'move', 'resize', 'pan'
+  const [resizeHandle, setResizeHandle] = useState(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const [selectionBox, setSelectionBox] = useState(null);
+  const [dragSnapshotted, setDragSnapshotted] = useState(false);
+
+  const allLayers = useMemo(() => getAllLayers(layers), [layers]);
+
+  const handleWheel = useCallback((e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? -0.1 : 0.1;
+    onZoom(clamp(zoom + delta, 0.1, 5));
+  }, [zoom, onZoom]);
+
+  const handleMouseDown = (e) => {
+    if (e.button === 1 || spaceHeld) {
+      // Middle mouse or space+click for panning
+      setIsPanning(true);
+      setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
+      return;
+    }
+    
+    if (e.button === 0 && e.target === canvasRef.current) {
+      // Click on empty canvas - start selection box or deselect
+      const rect = canvasRef.current.getBoundingClientRect();
+      const x = (e.clientX - rect.left - pan.x) / zoom;
+      const y = (e.clientY - rect.top - pan.y) / zoom;
+      setSelectionBox({ x1: x, y1: y, x2: x, y2: y });
+      if (!e.shiftKey) onSelect(null, false);
+    }
+  };
+
+  const handleMouseMove = (e) => {
+    if (isPanning) {
+      onPan({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+      return;
+    }
+    
+    if (isDragging && dragType === 'move') {
+      const dx = (e.clientX - dragStart.x) / zoom;
+      const dy = (e.clientY - dragStart.y) / zoom;
+      selectedLayers.forEach(id => {
+        const layer = findLayer(layers, id);
+        if (layer && !layer.locked) {
+          onUpdateLayer(id, { x: layer.x + dx, y: layer.y + dy });
+        }
+      });
+      setDragStart({ x: e.clientX, y: e.clientY });
+      return;
+    }
+    
+    if (isDragging && dragType === 'resize' && resizeHandle) {
+      const dx = (e.clientX - dragStart.x) / zoom;
+      const dy = (e.clientY - dragStart.y) / zoom;
+      const layer = findLayer(layers, selectedLayers[0]);
+      if (layer) {
+        const updates = {};
+        if (resizeHandle.includes('e')) { updates.width = Math.max(10, layer.width + dx); }
+        if (resizeHandle.includes('w')) { updates.x = layer.x + dx; updates.width = Math.max(10, layer.width - dx); }
+        if (resizeHandle.includes('s')) { updates.height = Math.max(10, layer.height + dy); }
+        if (resizeHandle.includes('n')) { updates.y = layer.y + dy; updates.height = Math.max(10, layer.height - dy); }
+        onUpdateLayer(layer.id, updates);
+      }
+      setDragStart({ x: e.clientX, y: e.clientY });
+      return;
+    }
+    
+    if (selectionBox) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      const x = (e.clientX - rect.left - pan.x) / zoom;
+      const y = (e.clientY - rect.top - pan.y) / zoom;
+      setSelectionBox(prev => ({ ...prev, x2: x, y2: y }));
+    }
+  };
+
+  const handleMouseUp = () => {
+    if (selectionBox) {
+      // Find layers within selection box
+      const box = {
+        x: Math.min(selectionBox.x1, selectionBox.x2),
+        y: Math.min(selectionBox.y1, selectionBox.y2),
+        width: Math.abs(selectionBox.x2 - selectionBox.x1),
+        height: Math.abs(selectionBox.y2 - selectionBox.y1)
+      };
+      if (box.width > 5 && box.height > 5) {
+        allLayers.forEach(layer => {
+          if (layer.x >= box.x && layer.y >= box.y && 
+              layer.x + layer.width <= box.x + box.width && 
+              layer.y + layer.height <= box.y + box.height) {
+            onSelect(layer.id, true);
+          }
+        });
+      }
+      setSelectionBox(null);
+    }
+    // Commit undo snapshot after drag/resize completes
+    if (dragSnapshotted && isDragging && (dragType === 'move' || dragType === 'resize')) {
+      onDragEnd && onDragEnd(layers);
+    }
+    setIsDragging(false);
+    setIsPanning(false);
+    setDragType(null);
+    setResizeHandle(null);
+    setDragSnapshotted(false);
+  };
+
+  const handleLayerMouseDown = (e, layerId) => {
+    e.stopPropagation();
+    const layer = findLayer(layers, layerId);
+    if (layer && layer.locked) return;
+    
+    if (!selectedLayers.includes(layerId)) {
+      onSelect(layerId, e.shiftKey || e.metaKey);
+    }
+    
+    // Snapshot state before drag begins for undo support
+    onDragStart && onDragStart(layers);
+    setIsDragging(true);
+    setDragType('move');
+    setDragStart({ x: e.clientX, y: e.clientY });
+    setDragSnapshotted(true);
+  };
+
+  const handleResizeMouseDown = (e, handle) => {
+    e.stopPropagation();
+    // Snapshot state before resize begins for undo support
+    onDragStart && onDragStart(layers);
+    setIsDragging(true);
+    setDragType('resize');
+    setResizeHandle(handle);
+    setDragStart({ x: e.clientX, y: e.clientY });
+    setDragSnapshotted(true);
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.code === 'Space' && !e.target.closest('input')) {
+        e.preventDefault();
+        setSpaceHeld(true);
+      }
+    };
+    const handleKeyUp = (e) => {
+      if (e.code === 'Space') setSpaceHeld(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
+  const renderLayer = (layer) => {
+    if (layer.visible === false) return null;
+    const isSelected = selectedLayers.includes(layer.id);
+    
+    const style = {
+      position: 'absolute',
+      left: layer.x,
+      top: layer.y,
+      width: layer.width,
+      height: layer.height,
+      transform: layer.rotation ? `rotate(${layer.rotation}deg)` : undefined,
+      backgroundColor: layer.type !== 'text' ? (layer.fill || 'transparent') : undefined,
+      borderRadius: layer.borderRadius || 0,
+      border: layer.stroke ? `${layer.strokeWidth || 1}px solid ${layer.stroke}` : (isSelected ? '1px solid #7c6ef6' : '1px solid transparent'),
+      boxShadow: layer.shadow ? `${layer.shadowX||0}px ${layer.shadowY||4}px ${layer.shadowBlur||8}px ${layer.shadowSpread||0}px rgba(0,0,0,0.2)` : undefined,
+      cursor: layer.locked ? 'not-allowed' : 'move',
+      opacity: layer.opacity !== undefined ? layer.opacity : 1,
+      overflow: 'hidden',
+      fontSize: layer.fontSize || undefined,
+      fontWeight: layer.fontWeight || undefined,
+      fontFamily: layer.fontFamily || undefined,
+      lineHeight: layer.lineHeight ? `${layer.lineHeight}px` : undefined,
+      letterSpacing: layer.letterSpacing || undefined,
+      textAlign: layer.textAlign || undefined,
+      color: layer.type === 'text' ? (layer.fill || '#000') : undefined,
+      display: layer.autoLayout === 'horizontal' ? 'flex' : layer.autoLayout === 'vertical' ? 'flex' : undefined,
+      flexDirection: layer.autoLayout === 'vertical' ? 'column' : undefined,
+      gap: layer.gap || undefined,
+      padding: layer.padding || undefined,
+    };
+
+    return (
+      <div key={layer.id}>
+        <div
+          style={style}
+          onMouseDown={(e) => handleLayerMouseDown(e, layer.id)}
+          onClick={(e) => { e.stopPropagation(); onSelect(layer.id, e.shiftKey || e.metaKey); }}
+          title={layer.name}
+        >
+          {layer.type === 'text' && (layer.content || layer.name)}
+          {layer.type === 'image' && layer.imageData && (
+            <img src={layer.imageData} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          )}
+          {layer.children && layer.children.map(child => renderLayer(child))}
+        </div>
+        
+        {/* Selection handles - sized inversely to zoom so they appear constant on screen */}
+        {isSelected && (
+          <>
+            {(() => {
+              const hSize = 8 / zoom;
+              const hOffset = hSize / 2;
+              return <>
+                <div className="resize-handle" style={{ left: layer.x - hOffset, top: layer.y - hOffset, width: hSize, height: hSize }} onMouseDown={(e) => handleResizeMouseDown(e, 'nw')} />
+                <div className="resize-handle" style={{ left: layer.x + layer.width/2 - hOffset, top: layer.y - hOffset, width: hSize, height: hSize }} onMouseDown={(e) => handleResizeMouseDown(e, 'n')} />
+                <div className="resize-handle" style={{ left: layer.x + layer.width - hOffset, top: layer.y - hOffset, width: hSize, height: hSize }} onMouseDown={(e) => handleResizeMouseDown(e, 'ne')} />
+                <div className="resize-handle" style={{ left: layer.x + layer.width - hOffset, top: layer.y + layer.height/2 - hOffset, width: hSize, height: hSize }} onMouseDown={(e) => handleResizeMouseDown(e, 'e')} />
+                <div className="resize-handle" style={{ left: layer.x + layer.width - hOffset, top: layer.y + layer.height - hOffset, width: hSize, height: hSize }} onMouseDown={(e) => handleResizeMouseDown(e, 'se')} />
+                <div className="resize-handle" style={{ left: layer.x + layer.width/2 - hOffset, top: layer.y + layer.height - hOffset, width: hSize, height: hSize }} onMouseDown={(e) => handleResizeMouseDown(e, 's')} />
+                <div className="resize-handle" style={{ left: layer.x - hOffset, top: layer.y + layer.height - hOffset, width: hSize, height: hSize }} onMouseDown={(e) => handleResizeMouseDown(e, 'sw')} />
+                <div className="resize-handle" style={{ left: layer.x - hOffset, top: layer.y + layer.height/2 - hOffset, width: hSize, height: hSize }} onMouseDown={(e) => handleResizeMouseDown(e, 'w')} />
+              </>;
+            })()}
+          </>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div
+      className="flex-1 overflow-hidden relative bg-editor-bg"
+      onWheel={handleWheel}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onMouseLeave={handleMouseUp}
+      style={{ cursor: spaceHeld || isPanning ? 'grab' : 'default' }}
+    >
+      {/* Rulers */}
+      <div className="absolute top-0 left-0 right-0 h-6 bg-editor-surface border-b border-editor-border z-10 flex items-end">
+        {Array.from({length: 50}, (_, i) => (
+          <div key={i} className="absolute text-[8px] text-editor-muted" style={{ left: pan.x + i * 100 * zoom }}>
+            <span>{i * 100}</span>
+          </div>
+        ))}
+      </div>
+      <div className="absolute top-6 left-0 bottom-0 w-6 bg-editor-surface border-r border-editor-border z-10 flex flex-col items-end">
+        {Array.from({length: 50}, (_, i) => (
+          <div key={i} className="absolute text-[8px] text-editor-muted" style={{ top: pan.y + i * 100 * zoom - 24 }}>
+            <span className="block -rotate-90">{i * 100}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Canvas area */}
+      <div
+        ref={canvasRef}
+        className="absolute inset-0 mt-6 ml-6 canvas-grid"
+        style={{ cursor: spaceHeld ? 'grab' : 'crosshair' }}
+      >
+        <div style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: '0 0' }}>
+          {/* Source image background */}
+          {sourceImage && (
+            <div style={{ position: 'absolute', left: 0, top: 0, width: canvasSize.width, height: canvasSize.height, opacity: 0.3 }}>
+              <img src={sourceImage} style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+            </div>
+          )}
+          
+          {/* Render all layers */}
+          {allLayers.map(layer => renderLayer(layer))}
+          
+          {/* Selection box */}
+          {selectionBox && (
+            <div className="selection-box" style={{
+              position: 'absolute',
+              left: Math.min(selectionBox.x1, selectionBox.x2),
+              top: Math.min(selectionBox.y1, selectionBox.y2),
+              width: Math.abs(selectionBox.x2 - selectionBox.x1),
+              height: Math.abs(selectionBox.y2 - selectionBox.y1),
+              pointerEvents: 'none'
+            }} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function findLayer(layers, id) {
+  for (const layer of layers) {
+    if (layer.id === id) return layer;
+    if (layer.children) {
+      const found = findLayer(layer.children, id);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+
+// ============================================================
+// TOOLBAR
+// ============================================================
+
+function Toolbar({ zoom, onZoom, onFitScreen, tool, setTool, onUndo, onRedo, canUndo, canRedo }) {
+  return (
+    <div className="h-10 bg-editor-panel border-b border-editor-border flex items-center px-4 gap-2 justify-between">
+      <div className="flex items-center gap-1">
+        {/* Logo */}
+        <div className="flex items-center gap-2 mr-4">
+          <div className="w-6 h-6 rounded bg-gradient-to-br from-editor-accent to-purple-400 flex items-center justify-center">
+            <span className="text-white text-xs font-bold">P</span>
+          </div>
+          <span className="text-sm font-semibold text-editor-text">PixelToPrototype</span>
+        </div>
+        
+        {/* Tools */}
+        <button onClick={() => setTool('select')} className={`p-1.5 rounded ${tool === 'select' ? 'bg-editor-accent/20 text-editor-accent' : 'hover:bg-editor-hover text-editor-muted'}`} title="Select (V)">
+          <Icons.Cursor />
+        </button>
+        <button onClick={() => setTool('move')} className={`p-1.5 rounded ${tool === 'move' ? 'bg-editor-accent/20 text-editor-accent' : 'hover:bg-editor-hover text-editor-muted'}`} title="Move (M)">
+          <Icons.Move />
+        </button>
+        <div className="w-px h-5 bg-editor-border mx-1"></div>
+        
+        {/* Undo/Redo */}
+        <button onClick={onUndo} disabled={!canUndo} className={`p-1.5 rounded ${canUndo ? 'hover:bg-editor-hover text-editor-muted' : 'opacity-30 cursor-not-allowed'}`} title="Undo (Ctrl+Z)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
+        </button>
+        <button onClick={onRedo} disabled={!canRedo} className={`p-1.5 rounded ${canRedo ? 'hover:bg-editor-hover text-editor-muted' : 'opacity-30 cursor-not-allowed'}`} title="Redo (Ctrl+Shift+Z)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.13-9.36L23 10"/></svg>
+        </button>
+      </div>
+
+      {/* Zoom controls */}
+      <div className="flex items-center gap-2">
+        <button onClick={() => onZoom(Math.max(0.1, zoom - 0.25))} className="p-1 rounded hover:bg-editor-hover text-editor-muted" title="Zoom Out">
+          <Icons.ZoomOut />
+        </button>
+        <span className="text-xs text-editor-muted w-12 text-center">{Math.round(zoom * 100)}%</span>
+        <button onClick={() => onZoom(Math.min(5, zoom + 0.25))} className="p-1 rounded hover:bg-editor-hover text-editor-muted" title="Zoom In">
+          <Icons.ZoomIn />
+        </button>
+        <button onClick={onFitScreen} className="p-1 rounded hover:bg-editor-hover text-editor-muted" title="Fit Screen">
+          <Icons.Maximize />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// UPLOAD MODAL
+// ============================================================
+
+function UploadModal({ isOpen, onClose, onImageLoad }) {
+  const [isDragOver, setIsDragOver] = useState(false);
+  const fileInputRef = useRef(null);
+
+  if (!isOpen) return null;
+
+  const handleFile = (file) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      onImageLoad(e.target.result);
+      onClose();
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const file = e.dataTransfer.files[0];
+    handleFile(file);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  };
+
+  const handleDragLeave = () => setIsDragOver(false);
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-slide-in" onClick={onClose}>
+      <div className="bg-editor-panel rounded-xl p-6 w-[480px] shadow-2xl border border-editor-border" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold">Upload Screenshot</h2>
+          <button onClick={onClose} className="text-editor-muted hover:text-editor-text p-1 rounded hover:bg-editor-hover">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        
+        <div
+          className={`border-2 border-dashed rounded-xl p-12 text-center transition-all cursor-pointer ${isDragOver ? 'drop-zone-active' : 'border-editor-border hover:border-editor-muted'}`}
+          onDrop={handleDrop}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onClick={() => fileInputRef.current?.click()}
+        >
+          <div className="w-12 h-12 mx-auto mb-4 rounded-full bg-editor-accent/10 flex items-center justify-center text-editor-accent">
+            <Icons.Upload />
+          </div>
+          <p className="text-sm text-editor-text mb-1">Drop your screenshot here</p>
+          <p className="text-xs text-editor-muted mb-4">or click to browse files</p>
+          <p className="text-[10px] text-editor-muted">Supports JPG, PNG, WEBP - Up to 10MB</p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            className="hidden"
+            onChange={(e) => handleFile(e.target.files[0])}
+          />
+        </div>
+        
+        <div className="mt-4 flex items-center gap-2 text-xs text-editor-muted">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          <span>You can also paste a screenshot with <kbd className="px-1 py-0.5 bg-editor-surface rounded text-[10px]">Ctrl+V</kbd></span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// CONTEXT MENU
+// ============================================================
+
+function ContextMenu({ x, y, onClose, items }) {
+  useEffect(() => {
+    const handleClick = () => onClose();
+    window.addEventListener('click', handleClick);
+    return () => window.removeEventListener('click', handleClick);
+  }, [onClose]);
+
+  return (
+    <div className="context-menu animate-slide-in" style={{ left: x, top: y }}>
+      {items.map((item, i) => 
+        item.separator ? (
+          <div key={i} className="h-px bg-editor-border my-1"></div>
+        ) : (
+          <div key={i} className="context-menu-item" onClick={() => { item.action(); onClose(); }}>
+            {item.icon && <span className="opacity-60">{item.icon}</span>}
+            <span className="flex-1">{item.label}</span>
+            {item.shortcut && <span className="text-[10px] text-editor-muted">{item.shortcut}</span>}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// WELCOME SCREEN
+// ============================================================
+
+function WelcomeScreen({ onUpload }) {
+  return (
+    <div className="flex-1 flex items-center justify-center bg-editor-bg">
+      <div className="text-center max-w-md">
+        <div className="w-16 h-16 mx-auto mb-6 rounded-2xl bg-gradient-to-br from-editor-accent to-purple-400 flex items-center justify-center shadow-lg shadow-editor-accent/20">
+          <span className="text-white text-2xl font-bold">P</span>
+        </div>
+        <h1 className="text-2xl font-bold mb-2 bg-gradient-to-r from-editor-accent to-purple-400 bg-clip-text text-transparent">
+          PixelToPrototype AI
+        </h1>
+        <p className="text-sm text-editor-muted mb-8">
+          Convert any screenshot into a fully editable design prototype.
+          Upload a screenshot to get started.
+        </p>
+        
+        <div className="grid grid-cols-3 gap-4 mb-8">
+          {[
+            { icon: '🎨', label: 'Color Extraction' },
+            { icon: '📐', label: 'Layout Detection' },
+            { icon: '🔤', label: 'Typography OCR' },
+            { icon: '🧩', label: 'Component Detection' },
+            { icon: '📦', label: 'Figma Export' },
+            { icon: '⚡', label: 'Design Tokens' },
+          ].map((feat, i) => (
+            <div key={i} className="p-3 rounded-lg bg-editor-surface border border-editor-border">
+              <div className="text-lg mb-1">{feat.icon}</div>
+              <div className="text-[10px] text-editor-muted">{feat.label}</div>
+            </div>
+          ))}
+        </div>
+        
+        <button onClick={onUpload} className="btn-primary px-6 py-3 text-sm flex items-center gap-2 mx-auto">
+          <Icons.Upload /> Upload Screenshot
+        </button>
+        
+        <p className="text-[10px] text-editor-muted mt-4">
+          Drag and drop, browse, or paste with Ctrl+V
+        </p>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// MAIN APP COMPONENT
+// ============================================================
+
+function App() {
+  // State
+  const [layers, setLayers] = useState([]);
+  const [selectedLayers, setSelectedLayers] = useState([]);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 100, y: 100 });
+  const [canvasSize, setCanvasSize] = useState({ width: 1440, height: 900 });
+  const [sourceImage, setSourceImage] = useState(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisProgress, setAnalysisProgress] = useState(0);
+  const [showUpload, setShowUpload] = useState(false);
+  const [activeTab, setActiveTab] = useState('layers');
+  const [tool, setTool] = useState('select');
+  const [colors, setColors] = useState([]);
+  const [typography, setTypography] = useState([]);
+  const [spacing, setSpacing] = useState([]);
+  const [contextMenu, setContextMenu] = useState(null);
+  const [hasProject, setHasProject] = useState(false);
+  const [ocrWarning, setOcrWarning] = useState(null);
+
+  // History management via useReducer to avoid stale closures
+  const historyReducer = (state, action) => {
+    switch (action.type) {
+      case 'PUSH': {
+        const newEntries = state.entries.slice(0, state.index + 1);
+        newEntries.push(action.payload);
+        const shifted = newEntries.length > 50;
+        if (shifted) newEntries.shift();
+        return { entries: newEntries, index: newEntries.length - 1 };
+      }
+      case 'UNDO': {
+        if (state.index > 0) return { ...state, index: state.index - 1 };
+        return state;
+      }
+      case 'REDO': {
+        if (state.index < state.entries.length - 1) return { ...state, index: state.index + 1 };
+        return state;
+      }
+      default:
+        return state;
+    }
+  };
+  const [historyState, historyDispatch] = useReducer(historyReducer, { entries: [], index: -1 });
+
+  // Derived state
+  const selectedLayer = useMemo(() => {
+    if (selectedLayers.length === 1) {
+      return findLayer(layers, selectedLayers[0]);
+    }
+    return null;
+  }, [layers, selectedLayers]);
+
+  const pushHistory = useCallback((newLayers) => {
+    historyDispatch({ type: 'PUSH', payload: JSON.stringify(newLayers) });
+  }, []);
+
+  // Derive layers from history whenever the index changes (single source of truth)
+  useEffect(() => {
+    if (historyState.index >= 0 && historyState.entries[historyState.index]) {
+      setLayers(JSON.parse(historyState.entries[historyState.index]));
+    }
+  }, [historyState.index]);
+
+  const undo = useCallback(() => {
+    if (historyState.index > 0) {
+      historyDispatch({ type: 'UNDO' });
+    }
+  }, [historyState.index]);
+
+  const redo = useCallback(() => {
+    if (historyState.index < historyState.entries.length - 1) {
+      historyDispatch({ type: 'REDO' });
+    }
+  }, [historyState.index, historyState.entries.length]);
+
+  // Layer operations
+  const handleSelect = useCallback((layerId, addToSelection) => {
+    if (!layerId) {
+      setSelectedLayers([]);
+      return;
+    }
+    if (addToSelection) {
+      setSelectedLayers(prev => 
+        prev.includes(layerId) ? prev.filter(id => id !== layerId) : [...prev, layerId]
+      );
+    } else {
+      setSelectedLayers([layerId]);
+    }
+  }, []);
+
+  const updateLayerInTree = (layers, id, updates) => {
+    return layers.map(layer => {
+      if (layer.id === id) {
+        return { ...layer, ...updates };
+      }
+      if (layer.children) {
+        return { ...layer, children: updateLayerInTree(layer.children, id, updates) };
+      }
+      return layer;
+    });
+  };
+
+  const removeLayerFromTree = (layers, id) => {
+    return layers.filter(layer => {
+      return layer.id !== id;
+    }).map(layer => {
+      if (layer.children) {
+        return { ...layer, children: removeLayerFromTree(layer.children, id) };
+      }
+      return layer;
+    });
+  };
+
+  const handleUpdateLayer = useCallback((id, updates) => {
+    setLayers(prev => {
+      const newLayers = updateLayerInTree(prev, id, updates);
+      return newLayers;
+    });
+  }, []);
+
+  // Drag undo support: snapshot before drag starts, commit final state on drag end
+  const handleDragStart = useCallback((currentLayers) => {
+    // Always snapshot pre-drag state, deduplicating against the last history entry
+    const serialized = JSON.stringify(currentLayers);
+    const lastEntry = historyState.entries[historyState.index];
+    if (lastEntry !== serialized) {
+      pushHistory(currentLayers);
+    }
+  }, [pushHistory, historyState.entries, historyState.index]);
+
+  const handleDragEnd = useCallback((layersAfterDrag) => {
+    pushHistory(layersAfterDrag);
+  }, [pushHistory]);
+
+  const handleToggleVisibility = useCallback((id) => {
+    setLayers(prev => {
+      const layer = findLayer(prev, id);
+      return updateLayerInTree(prev, id, { visible: layer?.visible === false ? true : false });
+    });
+  }, []);
+
+  const handleToggleLock = useCallback((id) => {
+    setLayers(prev => {
+      const layer = findLayer(prev, id);
+      return updateLayerInTree(prev, id, { locked: !layer?.locked });
+    });
+  }, []);
+
+  const handleRename = useCallback((id, name) => {
+    setLayers(prev => updateLayerInTree(prev, id, { name }));
+  }, []);
+
+  const handleDelete = useCallback(() => {
+    setLayers(prev => {
+      let newLayers = [...prev];
+      selectedLayers.forEach(id => {
+        newLayers = removeLayerFromTree(newLayers, id);
+      });
+      pushHistory(newLayers);
+      return newLayers;
+    });
+    setSelectedLayers([]);
+  }, [selectedLayers, pushHistory]);
+
+  const handleDuplicate = useCallback(() => {
+    setLayers(prev => {
+      const newLayers = [...prev];
+      selectedLayers.forEach(id => {
+        const layer = findLayer(prev, id);
+        if (layer) {
+          const dup = JSON.parse(JSON.stringify(layer));
+          dup.id = generateId();
+          dup.name = layer.name + ' (copy)';
+          dup.x = (dup.x || 0) + 20;
+          dup.y = (dup.y || 0) + 20;
+          newLayers.push(dup);
+        }
+      });
+      pushHistory(newLayers);
+      return newLayers;
+    });
+  }, [selectedLayers, pushHistory]);
+
+  const handleGroup = useCallback(() => {
+    if (selectedLayers.length < 2) return;
+    setLayers(prev => {
+      const selectedLayerObjects = selectedLayers.map(id => findLayer(prev, id)).filter(Boolean);
+      const minX = Math.min(...selectedLayerObjects.map(l => l.x || 0));
+      const minY = Math.min(...selectedLayerObjects.map(l => l.y || 0));
+      
+      let newLayers = [...prev];
+      selectedLayers.forEach(id => {
+        newLayers = removeLayerFromTree(newLayers, id);
+      });
+      
+      const group = {
+        id: generateId(),
+        name: 'Group',
+        type: 'group',
+        x: minX,
+        y: minY,
+        width: Math.max(...selectedLayerObjects.map(l => (l.x || 0) + (l.width || 0))) - minX,
+        height: Math.max(...selectedLayerObjects.map(l => (l.y || 0) + (l.height || 0))) - minY,
+        visible: true,
+        locked: false,
+        children: selectedLayerObjects
+      };
+      
+      newLayers.push(group);
+      pushHistory(newLayers);
+      return newLayers;
+    });
+    setSelectedLayers([]);
+  }, [selectedLayers, pushHistory]);
+
+  const handleUngroup = useCallback(() => {
+    if (selectedLayers.length !== 1) return;
+    const layer = findLayer(layers, selectedLayers[0]);
+    if (!layer || !layer.children) return;
+    
+    setLayers(prev => {
+      let newLayers = removeLayerFromTree([...prev], layer.id);
+      newLayers = [...newLayers, ...layer.children];
+      pushHistory(newLayers);
+      return newLayers;
+    });
+    setSelectedLayers([]);
+  }, [selectedLayers, layers, pushHistory]);
+
+  // Fit screen
+  const handleFitScreen = useCallback(() => {
+    setZoom(0.8);
+    setPan({ x: 100, y: 50 });
+  }, []);
+
+  // Export handler
+  const handleExport = useCallback((format) => {
+    const allLayersList = getAllLayers(layers);
+    
+    switch (format) {
+      case 'figma-json': {
+        const content = generateFigmaJSON(allLayersList, colors, typography, spacing);
+        downloadFile(content, 'design-export.fig.json', 'application/json');
+        break;
+      }
+      case 'figma-tokens': {
+        const tokens = generateDesignTokens(colors, typography, spacing);
+        downloadFile(JSON.stringify(tokens, null, 2), 'design-tokens.json', 'application/json');
+        break;
+      }
+      case 'html': {
+        const content = generateHTMLExport(allLayersList);
+        downloadFile(content, 'design-export.html', 'text/html');
+        break;
+      }
+      case 'react': {
+        const content = generateReactExport(allLayersList);
+        downloadFile(content, 'DesignExport.jsx', 'text/javascript');
+        break;
+      }
+      case 'tailwind': {
+        const content = generateTailwindExport(allLayersList);
+        downloadFile(content, 'design-export-tailwind.html', 'text/html');
+        break;
+      }
+      case 'css': {
+        const content = generateCSSExport(allLayersList);
+        downloadFile(content, 'design-export.css', 'text/css');
+        break;
+      }
+      case 'json': {
+        const content = JSON.stringify({ layers: allLayersList, colors, typography, spacing }, null, 2);
+        downloadFile(content, 'design-structure.json', 'application/json');
+        break;
+      }
+      case 'svg': {
+        const content = generateSVGExport(allLayersList, canvasSize.width, canvasSize.height);
+        downloadFile(content, 'design-export.svg', 'image/svg+xml');
+        break;
+      }
+      case 'png': {
+        // Create canvas and render
+        const canvas = document.createElement('canvas');
+        canvas.width = canvasSize.width;
+        canvas.height = canvasSize.height;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        allLayersList.forEach(layer => {
+          if (layer.fill) {
+            ctx.fillStyle = layer.fill;
+            if (layer.borderRadius) {
+              ctx.beginPath();
+              ctx.roundRect(layer.x, layer.y, layer.width, layer.height, layer.borderRadius);
+              ctx.fill();
+            } else {
+              ctx.fillRect(layer.x, layer.y, layer.width, layer.height);
+            }
+          }
+          if (layer.type === 'text' && layer.content) {
+            ctx.fillStyle = layer.fill || '#000000';
+            ctx.font = `${layer.fontWeight || 400} ${layer.fontSize || 14}px ${layer.fontFamily || 'sans-serif'}`;
+            ctx.fillText(layer.content, layer.x, layer.y + (layer.fontSize || 14));
+          }
+        });
+        canvas.toBlob((blob) => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'design-export.png';
+          a.click();
+          URL.revokeObjectURL(url);
+        });
+        break;
+      }
+    }
+  }, [layers, colors, typography, spacing, canvasSize]);
+
+
+  // Image analysis pipeline
+  const analyzeImage = useCallback(async (dataUrl) => {
+    setIsAnalyzing(true);
+    setAnalysisProgress(0);
+    setSourceImage(dataUrl);
+    setHasProject(true);
+
+    try {
+      // Load image
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = dataUrl;
+      });
+
+      const width = img.naturalWidth;
+      const height = img.naturalHeight;
+      setCanvasSize({ width, height });
+
+      // Create canvas for pixel analysis
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, width, height);
+
+      const analyzer = new ImageAnalyzer(imageData, width, height);
+
+      // Step 1: Layout detection
+      setAnalysisProgress(10);
+      await new Promise(r => setTimeout(r, 200));
+      const regions = analyzer.detectLayoutRegions();
+      setAnalysisProgress(20);
+
+      // Step 2: Typography detection via OCR (if available)
+      let textRegions = [];
+      setAnalysisProgress(25);
+      try {
+        if (typeof Tesseract !== 'undefined') {
+          const worker = await Tesseract.createWorker('eng');
+          const { data } = await worker.recognize(dataUrl);
+          textRegions = (data.words || []).filter(w => w.confidence > 50).map(word => ({
+            text: word.text,
+            x: word.bbox.x0,
+            y: word.bbox.y0,
+            width: word.bbox.x1 - word.bbox.x0,
+            height: word.bbox.y1 - word.bbox.y0,
+            fontSize: Math.round((word.bbox.y1 - word.bbox.y0) * 0.75),
+            confidence: word.confidence
+          }));
+          await worker.terminate();
+        } else {
+          setOcrWarning('Tesseract.js not loaded: text detection skipped. Text layers will not be created.');
+        }
+      } catch (ocrError) {
+        console.warn('OCR not available or failed:', ocrError);
+        // Do NOT generate placeholder text regions - warn user instead
+        setOcrWarning('OCR unavailable: text layers could not be extracted. Upload will proceed without text detection.');
+        textRegions = [];
+      }
+      setAnalysisProgress(40);
+
+      // Step 3: Color extraction
+      await new Promise(r => setTimeout(r, 100));
+      const extractedColors = analyzer.extractColors(12);
+      setColors(extractedColors);
+      setAnalysisProgress(55);
+
+      // Step 4: Component detection
+      await new Promise(r => setTimeout(r, 100));
+      const components = analyzer.detectComponents();
+      setAnalysisProgress(70);
+
+      // Step 5: Spacing detection
+      const detectedSpacing = analyzer.detectSpacing(regions);
+      setSpacing(detectedSpacing.length > 0 ? detectedSpacing : [4, 8, 16, 24, 32, 48, 64]);
+      setAnalysisProgress(80);
+
+      // Step 6: Build typography scale
+      const typographyScale = buildTypographyScale(textRegions);
+      setTypography(typographyScale);
+      setAnalysisProgress(85);
+
+      // Step 7: Build layer hierarchy
+      await new Promise(r => setTimeout(r, 150));
+      const layerTree = buildLayerHierarchy(regions, components, textRegions, width, height, extractedColors);
+      setLayers(layerTree);
+      pushHistory(layerTree);
+      setAnalysisProgress(100);
+
+      // Save to IndexedDB
+      try {
+        await saveProject({
+          id: 'current',
+          name: 'Untitled Project',
+          layers: layerTree,
+          colors: extractedColors,
+          typography: typographyScale,
+          spacing: detectedSpacing,
+          sourceImage: dataUrl,
+          updatedAt: Date.now()
+        });
+        localStorage.setItem('ptp_lastProject', 'current');
+      } catch (e) {
+        console.warn('Failed to save to IndexedDB:', e);
+      }
+
+      // Finish
+      await new Promise(r => setTimeout(r, 500));
+      setIsAnalyzing(false);
+      setActiveTab('layers');
+    } catch (error) {
+      console.error('Analysis failed:', error);
+      setIsAnalyzing(false);
+      setAnalysisProgress(0);
+    }
+  }, [pushHistory]);
+
+  // Build typography scale from detected text
+  function buildTypographyScale(textRegions) {
+    if (textRegions.length === 0) {
+      return [
+        { name: 'H1', fontSize: 48, fontWeight: 700, fontFamily: 'Inter', lineHeight: 56 },
+        { name: 'H2', fontSize: 36, fontWeight: 700, fontFamily: 'Inter', lineHeight: 44 },
+        { name: 'H3', fontSize: 24, fontWeight: 600, fontFamily: 'Inter', lineHeight: 32 },
+        { name: 'Body', fontSize: 16, fontWeight: 400, fontFamily: 'Inter', lineHeight: 24 },
+        { name: 'Caption', fontSize: 12, fontWeight: 400, fontFamily: 'Inter', lineHeight: 16 },
+        { name: 'Label', fontSize: 14, fontWeight: 500, fontFamily: 'Inter', lineHeight: 20 },
+      ];
+    }
+    
+    // Cluster by font size
+    const sizes = textRegions.map(t => t.fontSize).filter(s => s > 5);
+    const uniqueSizes = [...new Set(sizes)].sort((a, b) => b - a);
+    
+    const scale = [];
+    const names = ['H1', 'H2', 'H3', 'H4', 'Body', 'Caption', 'Label', 'Button'];
+    
+    uniqueSizes.slice(0, 8).forEach((size, i) => {
+      scale.push({
+        name: names[i] || `Text-${size}`,
+        fontSize: size,
+        fontWeight: i < 3 ? 700 : i < 5 ? 600 : 400,
+        fontFamily: 'Inter',
+        lineHeight: Math.round(size * 1.4)
+      });
+    });
+    
+    return scale.length > 0 ? scale : [
+      { name: 'H1', fontSize: 48, fontWeight: 700, fontFamily: 'Inter', lineHeight: 56 },
+      { name: 'Body', fontSize: 16, fontWeight: 400, fontFamily: 'Inter', lineHeight: 24 },
+    ];
+  }
+
+  // Build layer hierarchy from analysis results
+  function buildLayerHierarchy(regions, components, textRegions, width, height, extractedColors) {
+    const rootFrame = {
+      id: generateId(),
+      name: 'Frame',
+      type: 'frame',
+      x: 0, y: 0,
+      width, height,
+      visible: true,
+      locked: false,
+      fill: extractedColors.length > 0 ? extractedColors[extractedColors.length - 1].hex : '#ffffff',
+      children: []
+    };
+
+    // Add sections from layout regions
+    regions.forEach((region, i) => {
+      const section = {
+        id: generateId(),
+        name: `Section ${i + 1}`,
+        type: 'section',
+        x: region.x,
+        y: region.y,
+        width: region.width,
+        height: region.height,
+        visible: true,
+        locked: false,
+        fill: 'transparent',
+        children: []
+      };
+
+      // Add components within this section
+      const sectionComponents = components.filter(c => 
+        c.y >= region.y && c.y + c.height <= region.y + region.height
+      );
+
+      sectionComponents.forEach((comp, j) => {
+        const layer = {
+          id: generateId(),
+          name: `${comp.type.charAt(0).toUpperCase() + comp.type.slice(1)} ${j + 1}`,
+          type: comp.type,
+          x: comp.x,
+          y: comp.y,
+          width: comp.width,
+          height: comp.height,
+          visible: true,
+          locked: false,
+          fill: comp.color,
+          borderRadius: comp.type === 'button' ? 6 : comp.type === 'card' ? 8 : comp.type === 'input' ? 4 : 0,
+          children: []
+        };
+        section.children.push(layer);
+      });
+
+      // Add text layers within this section
+      const sectionTexts = textRegions.filter(t => 
+        t.y >= region.y && t.y + t.height <= region.y + region.height
+      );
+
+      sectionTexts.forEach((text, j) => {
+        const textLayer = {
+          id: generateId(),
+          name: text.text.substring(0, 30) || `Text ${j + 1}`,
+          type: 'text',
+          x: text.x,
+          y: text.y,
+          width: text.width,
+          height: text.height,
+          visible: true,
+          locked: false,
+          content: text.text,
+          fontSize: text.fontSize || 14,
+          fontWeight: text.fontSize > 24 ? 700 : text.fontSize > 16 ? 600 : 400,
+          fontFamily: 'Inter',
+          lineHeight: Math.round((text.fontSize || 14) * 1.4),
+          letterSpacing: 0,
+          textAlign: 'left',
+          fill: extractedColors.length > 0 ? extractedColors[0].hex : '#000000'
+        };
+        section.children.push(textLayer);
+      });
+
+      rootFrame.children.push(section);
+    });
+
+    return [rootFrame];
+  }
+
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.target.closest('input, textarea, select')) return;
+      
+      // Delete
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedLayers.length > 0) {
+        e.preventDefault();
+        handleDelete();
+      }
+      // Undo
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      }
+      // Redo
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && e.shiftKey) {
+        e.preventDefault();
+        redo();
+      }
+      // Duplicate
+      if ((e.metaKey || e.ctrlKey) && e.key === 'd') {
+        e.preventDefault();
+        handleDuplicate();
+      }
+      // Group
+      if ((e.metaKey || e.ctrlKey) && e.key === 'g' && !e.shiftKey) {
+        e.preventDefault();
+        handleGroup();
+      }
+      // Ungroup
+      if ((e.metaKey || e.ctrlKey) && e.key === 'g' && e.shiftKey) {
+        e.preventDefault();
+        handleUngroup();
+      }
+      // Select all
+      if ((e.metaKey || e.ctrlKey) && e.key === 'a') {
+        e.preventDefault();
+        setSelectedLayers(getAllLayers(layers).map(l => l.id));
+      }
+      // Tool shortcuts
+      if (e.key === 'v') setTool('select');
+      if (e.key === 'm') setTool('move');
+      // Zoom shortcuts
+      if ((e.metaKey || e.ctrlKey) && (e.key === '=' || e.key === '+')) {
+        e.preventDefault();
+        setZoom(z => Math.min(5, z + 0.25));
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === '-') {
+        e.preventDefault();
+        setZoom(z => Math.max(0.1, z - 0.25));
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === '0') {
+        e.preventDefault();
+        setZoom(1);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedLayers, layers, handleDelete, handleDuplicate, handleGroup, handleUngroup, undo, redo]);
+
+  // Clipboard paste for image upload
+  useEffect(() => {
+    const handlePaste = (e) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          e.preventDefault();
+          const file = item.getAsFile();
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            analyzeImage(ev.target.result);
+          };
+          reader.readAsDataURL(file);
+          break;
+        }
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [analyzeImage]);
+
+  // Global drag and drop
+  useEffect(() => {
+    const handleDragOver = (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    };
+    const handleDrop = (e) => {
+      e.preventDefault();
+      const file = e.dataTransfer.files[0];
+      if (file && file.type.startsWith('image/')) {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          analyzeImage(ev.target.result);
+        };
+        reader.readAsDataURL(file);
+      }
+    };
+
+    window.addEventListener('dragover', handleDragOver);
+    window.addEventListener('drop', handleDrop);
+    return () => {
+      window.removeEventListener('dragover', handleDragOver);
+      window.removeEventListener('drop', handleDrop);
+    };
+  }, [analyzeImage]);
+
+  // Load saved project on mount
+  useEffect(() => {
+    const loadSaved = async () => {
+      try {
+        const lastProjectId = localStorage.getItem('ptp_lastProject');
+        if (lastProjectId) {
+          const project = await loadProject(lastProjectId);
+          if (project) {
+            setLayers(project.layers || []);
+            setColors(project.colors || []);
+            setTypography(project.typography || []);
+            setSpacing(project.spacing || []);
+            setSourceImage(project.sourceImage || null);
+            setHasProject(true);
+            if (project.layers) pushHistory(project.layers);
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to load saved project:', e);
+      }
+    };
+    loadSaved();
+  }, []);
+
+  // Context menu handler
+  const handleContextMenu = useCallback((e) => {
+    e.preventDefault();
+    const items = [
+      { label: 'Select All', shortcut: 'Ctrl+A', action: () => setSelectedLayers(getAllLayers(layers).map(l => l.id)) },
+      { separator: true },
+      { label: 'Duplicate', shortcut: 'Ctrl+D', action: handleDuplicate, icon: <Icons.Copy /> },
+      { label: 'Group', shortcut: 'Ctrl+G', action: handleGroup, icon: <Icons.Folder /> },
+      { label: 'Ungroup', shortcut: 'Ctrl+Shift+G', action: handleUngroup },
+      { separator: true },
+      { label: 'Delete', shortcut: 'Del', action: handleDelete, icon: <Icons.Trash /> },
+      { separator: true },
+      { label: 'Upload Image', action: () => setShowUpload(true), icon: <Icons.Upload /> },
+      { label: 'Fit to Screen', action: handleFitScreen, icon: <Icons.Maximize /> },
+    ];
+    setContextMenu({ x: e.clientX, y: e.clientY, items });
+  }, [layers, handleDuplicate, handleGroup, handleUngroup, handleDelete, handleFitScreen]);
+
+  // Render
+  return (
+    <div className="h-full flex flex-col" onContextMenu={handleContextMenu}>
+      {/* Toolbar */}
+      <Toolbar
+        zoom={zoom}
+        onZoom={setZoom}
+        onFitScreen={handleFitScreen}
+        tool={tool}
+        setTool={setTool}
+        onUndo={undo}
+        onRedo={redo}
+        canUndo={historyState.index > 0}
+        canRedo={historyState.index < historyState.entries.length - 1}
+      />
+
+      {/* Main content */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Left sidebar */}
+        <LeftSidebar
+          layers={layers}
+          selectedLayers={selectedLayers}
+          onSelect={handleSelect}
+          onToggleVisibility={handleToggleVisibility}
+          onToggleLock={handleToggleLock}
+          onRename={handleRename}
+          onDelete={handleDelete}
+          onDuplicate={handleDuplicate}
+          colors={colors}
+          typography={typography}
+          spacing={spacing}
+          onUpload={() => setShowUpload(true)}
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          onExport={handleExport}
+        />
+
+        {/* Center canvas or welcome */}
+        {hasProject ? (
+          <CanvasEditor
+            layers={layers}
+            selectedLayers={selectedLayers}
+            onSelect={handleSelect}
+            onUpdateLayer={handleUpdateLayer}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
+            zoom={zoom}
+            pan={pan}
+            onZoom={setZoom}
+            onPan={setPan}
+            canvasSize={canvasSize}
+            sourceImage={sourceImage}
+          />
+        ) : (
+          <WelcomeScreen onUpload={() => setShowUpload(true)} />
+        )}
+
+        {/* Right sidebar */}
+        <RightSidebar
+          selectedLayer={selectedLayer}
+          onUpdateLayer={handleUpdateLayer}
+        />
+      </div>
+
+      {/* Upload modal */}
+      <UploadModal
+        isOpen={showUpload}
+        onClose={() => setShowUpload(false)}
+        onImageLoad={analyzeImage}
+      />
+
+      {/* Analysis progress panel */}
+      <AnalysisPanel progress={analysisProgress} isAnalyzing={isAnalyzing} />
+
+      {/* OCR warning notification */}
+      {ocrWarning && (
+        <div className="fixed bottom-4 right-4 z-50 max-w-sm bg-yellow-900/90 border border-yellow-600 text-yellow-200 px-4 py-3 rounded-lg shadow-lg animate-slide-in flex items-start gap-2">
+          <span className="text-yellow-400 mt-0.5">&#9888;</span>
+          <div className="flex-1">
+            <p className="text-sm">{ocrWarning}</p>
+          </div>
+          <button onClick={() => setOcrWarning(null)} className="text-yellow-400 hover:text-yellow-200 text-lg leading-none">&times;</button>
+        </div>
+      )}
+
+      {/* Context menu */}
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          items={contextMenu.items}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
